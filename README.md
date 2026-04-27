@@ -8,7 +8,7 @@ PlotterZine est un fichier HTML unique qui tourne entièrement dans le navigateu
 
 ## Démo rapide
 
-Télécharger [plotterZine.html](plotterZine.html) et l'ouvrir dans un navigateur — aucune connexion, aucun serveur requis.
+Télécharger [plotterZine.html]((https://rossignol-martial.github.io/outil-trames/plotterZine.html) et l'ouvrir dans un navigateur — aucune connexion, aucun serveur requis.
 
 ---
 
