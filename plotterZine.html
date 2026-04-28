@@ -543,19 +543,26 @@ function updateModeUI() {
 }
 
 // ── Thumbnail ─────────────────────────────────────────────────────
-function makeThumbnail(svgText, vb) {
+function makeThumbnail(svgText, vbOrig) {
   return new Promise(resolve => {
-    const [,,vw,vh] = vb.split(/\s+/).map(Number);
-    const MAX = 200, sc = Math.min(MAX/vw, MAX/vh);
-    const w = Math.max(1,Math.round(vw*sc)), h = Math.max(1,Math.round(vh*sc));
-    let clean = svgText.replace(/<svg([^>]*)>/, (m,attrs) => {
-      if (!attrs.includes('xmlns')) attrs += ' xmlns="http://www.w3.org/2000/svg"';
-      attrs = attrs.replace(/\bwidth="[^"]*"/, `width="${w}"`);
-      attrs = attrs.replace(/\bheight="[^"]*"/, `height="${h}"`);
-      if (!attrs.includes('width=')) attrs += ` width="${w}"`;
-      if (!attrs.includes('height=')) attrs += ` height="${h}"`;
-      return `<svg${attrs}>`;
-    });
+    const parts = (vbOrig||'0 0 100 100').split(/[\s,]+/).map(Number);
+    const vx=parts[0]||0, vy=parts[1]||0, vw=parts[2]||100, vh=parts[3]||100;
+    const MAX = 400, sc = Math.min(MAX/vw, MAX/vh);
+    const w = Math.max(1, Math.round(vw*sc)), h = Math.max(1, Math.round(vh*sc));
+    // SVG nettoyé avec dimensions px explicites et viewBox original
+    let clean = svgText
+      .replace(/<\?xml[^>]*>/g, '')
+      .replace(/<!DOCTYPE[^>]*>/gi, '')
+      .replace(/<svg([^>]*)>/, (m, attrs) => {
+        if (!attrs.includes('xmlns')) attrs = ' xmlns="http://www.w3.org/2000/svg"' + attrs;
+        // Forcer width/height en px et viewBox original
+        attrs = attrs.replace(/\s*\bwidth\s*=\s*"[^"]*"/g, '');
+        attrs = attrs.replace(/\s*\bheight\s*=\s*"[^"]*"/g, '');
+        attrs = attrs.replace(/\s*\bviewBox\s*=\s*"[^"]*"/g, '');
+        attrs += ` width="${w}" height="${h}" viewBox="${vbOrig}"`;
+        return `<svg${attrs}>`;
+      });
+    // Rasteriser via canvas
     const blob = new Blob([clean], {type:'image/svg+xml;charset=utf-8'});
     const url = URL.createObjectURL(blob);
     const img = new Image();
@@ -564,20 +571,22 @@ function makeThumbnail(svgText, vb) {
       cv.width=w; cv.height=h;
       const ctx = cv.getContext('2d');
       ctx.fillStyle='#fff'; ctx.fillRect(0,0,w,h);
-      ctx.drawImage(img,0,0,w,h);
+      // drawImage avec src rect pour s'assurer du scaling correct
+      ctx.drawImage(img, 0, 0, img.naturalWidth||w, img.naturalHeight||h, 0, 0, w, h);
       URL.revokeObjectURL(url);
-      resolve(cv.toDataURL('image/png'));
+      resolve({png: cv.toDataURL('image/png'), pw: w, ph: h});
     };
     img.onerror = () => {
       URL.revokeObjectURL(url);
+      // Fallback: canvas gris avec texte
       const cv = document.createElement('canvas');
       cv.width=w; cv.height=h;
-      const ctx = cv.getContext('2d');
-      ctx.fillStyle='#e8e8e8'; ctx.fillRect(0,0,w,h);
-      ctx.fillStyle='#888'; ctx.font=`${Math.min(w,h)*.4}px sans-serif`;
+      const ctx=cv.getContext('2d');
+      ctx.fillStyle='#f0f0f0'; ctx.fillRect(0,0,w,h);
+      ctx.fillStyle='#888'; ctx.font=`${Math.min(w,h)*.15}px sans-serif`;
       ctx.textAlign='center'; ctx.textBaseline='middle';
-      ctx.fillText('SVG',w/2,h/2);
-      resolve(cv.toDataURL('image/png'));
+      ctx.fillText('SVG', w/2, h/2);
+      resolve({png: cv.toDataURL('image/png'), pw: w, ph: h});
     };
     img.src = url;
   });
@@ -596,10 +605,46 @@ async function loadFiles(files) {
     const txt = await f.text();
     const doc = new DOMParser().parseFromString(txt,'image/svg+xml');
     const el  = doc.querySelector('svg'); if (!el) continue;
-    let vb = el.getAttribute('viewBox');
-    if (!vb) { const w=parseFloat(el.getAttribute('width'))||100; const h=parseFloat(el.getAttribute('height'))||100; vb=`0 0 ${w} ${h}`; }
-    const thumb = await makeThumbnail(txt, vb);
-    pages.push({id:Date.now()+Math.random(), name:f.name.replace(/\.svg$/i,'').slice(0,20), svgText:txt, vb, thumb});
+    let vbOrig = el.getAttribute('viewBox'); // viewBox original du SVG
+    const rawW = el.getAttribute('width')||'100';
+    const rawH = el.getAttribute('height')||'100';
+    const toMM = v => {
+      const n = parseFloat(v);
+      if (!v || isNaN(n)) return 100;
+      if (v.endsWith('mm')) return n;
+      if (v.endsWith('cm')) return n*10;
+      if (v.endsWith('in')) return n*25.4;
+      if (v.endsWith('pt')) return n*25.4/72;
+      return n*25.4/96; // px ou sans unité → px
+    };
+    if (!vbOrig) {
+      // Pas de viewBox : construire depuis width/height dans l'espace de coords du SVG
+      // Si l'unité est px (ou sans unité), vbOrig reste en px
+      // Si l'unité est mm, vbOrig est en mm
+      const vpW = parseFloat(rawW)||100;
+      const vpH = parseFloat(rawH)||100;
+      vbOrig = `0 0 ${vpW} ${vpH}`;
+    }
+    // Calculer le viewBox normalisé en mm pour le calcul du fit
+    let vb;
+    const hasMM = rawW.endsWith('mm') || rawH.endsWith('mm');
+    if (hasMM) {
+      // SVG en mm → viewBox déjà en mm
+      vb = vbOrig;
+    } else {
+      // SVG en px → convertir le viewBox en mm
+      const vbP = vbOrig.split(/[\s,]+/).map(Number);
+      if (vbP.length === 4) {
+        const s = 25.4/96;
+        vb = `${(vbP[0]*s).toFixed(3)} ${(vbP[1]*s).toFixed(3)} ${(vbP[2]*s).toFixed(3)} ${(vbP[3]*s).toFixed(3)}`;
+      } else {
+        vb = vbOrig;
+      }
+    }
+    // Thumbnail utilise le viewBox ORIGINAL (espace coords du SVG source)
+    const thumbResult = await makeThumbnail(txt, vbOrig);
+    const thumb=thumbResult.png, pw=thumbResult.pw, ph=thumbResult.ph;
+    pages.push({id:Date.now()+Math.random(), name:f.name.replace(/\.svg$/i,'').slice(0,20), svgText:txt, vb, vbOrig, thumb, pw, ph});
   }
   buildLib(); render();
   toast(`${svgs.length} SVG chargé(s).`);
@@ -762,13 +807,32 @@ function renderSheet(side, svgId) {
     if (s.locked) return;
     const pl = placements[plKey(s.id)]; if (!pl) return;
     const pg = pages.find(p=>p.id===pl.pageId); if (!pg||!pg.thumb) return;
+    // pg.pw/ph = dimensions du PNG thumbnail en pixels
+    // pg.vb = viewBox en mm du SVG source
     const [,,vw,vh] = pg.vb.split(/\s+/).map(Number);
     const sw=s.w||PW, sh=s.h||PH;
     const rot=pl.rotate||0, swapped=Math.abs(rot)%180===90;
-    const fit=Math.min((sw-SM*2)/(swapped?vh:vw),(sh-SM*2)/(swapped?vw:vh))*(pl.scale||1);
-    const dw=vw*fit, dh=vh*fit;
+    const sc=pl.scale||1;
+    // Dimensions de la case (marge incluse) selon orientation
+    const cw=swapped?sh-SM*2:sw-SM*2, ch=swapped?sw-SM*2:sh-SM*2;
+    // Cover : scale pour remplir la case, centré, clippé
+    const fitCover = Math.max(cw/vw, ch/vh) * sc;
+    const dw = vw*fitCover, dh = vh*fitCover;
     const cx=s.x+sw/2+(pl.tx||0), cy=s.y+sh/2+(pl.ty||0);
-    o+=`<g clip-path="url(#${uid}cp${s.id})"><image href="${pg.thumb}" width="${dw}" height="${dh}" transform="translate(${cx},${cy}) rotate(${rot}) translate(${-dw/2},${-dh/2})" preserveAspectRatio="xMidYMid meet"/></g>`;
+    // SVG imbriqué avec viewBox original → rendu vectoriel correct
+    const vbOrig2 = pg.vbOrig || pg.vb;
+    const [,,vbW,vbH] = vbOrig2.split(/[\s,]+/).map(Number);
+    const cw3=swapped?sh-SM*2:sw-SM*2, ch3=swapped?sw-SM*2:sh-SM*2;
+    const fitC2=Math.max(cw3/vbW, ch3/vbH)*sc;
+    const dw3=vbW*fitC2, dh3=vbH*fitC2;
+    const innerSVG = pg.thumb; // data URI SVG avec viewBox original
+    o+=`<g clip-path="url(#${uid}cp${s.id})">`
+      +`<g transform="translate(${cx},${cy}) rotate(${rot})">`
+      +`<image href="${innerSVG}" `
+      +`x="${-(dw3/2)}" y="${-(dh3/2)}" `
+      +`width="${dw3}" height="${dh3}" `
+      +`preserveAspectRatio="xMidYMid slice"/>`
+      +`</g></g>`;
   });
 
   // Plis
@@ -1010,29 +1074,41 @@ function exportSVG() {
   }
 }
 
-function exportFace(filename) {
+async function exportFace(filename) {
   const m=MODES[CUR_MODE];
   let defs='<defs>'+SLOTS.map(s=>{const sw=s.w||PW,sh=s.h||PH;return `<clipPath id="cp${s.id}"><rect x="${s.x+SM}" y="${s.y+SM}" width="${sw-SM*2}" height="${sh-SM*2}"/></clipPath>`;}).join('')+'</defs>';
   let o='';
+  toast('Génération SVG en cours…');
+  await new Promise(r=>setTimeout(r,50)); // laisser le browser respirer
   SLOTS.forEach(s => {
     const pl=placements[plKey(s.id)]; if(!pl) return;
     const pg=pages.find(p=>p.id===pl.pageId); if(!pg) return;
-    const [,,vw,vh]=pg.vb.split(/\s+/).map(Number);
     const sw=s.w||PW, sh=s.h||PH;
     const rot=pl.rotate||0, swapped=Math.abs(rot)%180===90;
-    const fit=Math.min((sw-SM*2)/(swapped?vh:vw),(sh-SM*2)/(swapped?vw:vh))*(pl.scale||1);
-    const dw=vw*fit, dh=vh*fit;
     const cx=s.x+sw/2+(pl.tx||0), cy=s.y+sh/2+(pl.ty||0);
+    const sc=pl.scale||1;
+    // viewBox original du SVG source (espace de coords px ou mm)
+    const vbE = pg.vbOrig || pg.vb;
+    const vbParts = vbE.split(/[\s,]+/).map(Number);
+    const vbw=vbParts[2]||100, vbh=vbParts[3]||100;
+    // Cover : remplir la case
+    const cw=swapped?sh-SM*2:sw-SM*2, ch=swapped?sw-SM*2:sh-SM*2;
+    const fitC=Math.max(cw/vbw, ch/vbh)*sc;
+    const dw=vbw*fitC, dh=vbh*fitC;
+    // Extraire et préfixer les IDs du SVG source pour éviter collisions
+    const pid='e'+s.id;
     const parser=new DOMParser();
     const srcSvg=parser.parseFromString(pg.svgText,'image/svg+xml').querySelector('svg');
-    const pid='s'+s.id;
+    if (!srcSvg) return;
     const iDefs=srcSvg.querySelector('defs');
-    let iDefsStr=iDefs?iDefs.outerHTML.replace(/\bid="([^"]+)"/g,(_,id)=>`id="${pid}_${id}"`).replace(/url\(#([^)]+)\)/g,(_,id)=>`url(#${pid}_${id})`).replace(/href="#([^"]+)"/g,(_,id)=>`href="#${pid}_${id}"`):'';
-    let inner=srcSvg.innerHTML.replace(/<defs[\s\S]*?<\/defs>/gi,'')
+    const prefixID=(str)=>str
       .replace(/\bid="([^"]+)"/g,(_,id)=>`id="${pid}_${id}"`)
       .replace(/url\(#([^)]+)\)/g,(_,id)=>`url(#${pid}_${id})`)
       .replace(/href="#([^"]+)"/g,(_,id)=>`href="#${pid}_${id}"`);
-    o+=`<g clip-path="url(#cp${s.id})"><g transform="translate(${cx},${cy}) rotate(${rot}) translate(${-dw/2},${-dh/2}) scale(${fit})">${iDefsStr}<g>${inner}</g></g></g>`;
+    const iDefsStr=iDefs?prefixID(iDefs.outerHTML):'';
+    const inner=prefixID(srcSvg.innerHTML.replace(/<defs[\s\S]*?<\/defs>/gi,''));
+    const embSvg=`<svg xmlns="http://www.w3.org/2000/svg" width="${dw}" height="${dh}" viewBox="${vbE}" preserveAspectRatio="xMidYMid slice" overflow="hidden">${iDefsStr}<g>${inner}</g></svg>`;
+    o+=`<g clip-path="url(#cp${s.id})"><g transform="translate(${cx},${cy}) rotate(${rot}) translate(${-(dw/2)},${-(dh/2)})">${embSvg}</g></g>`;
   });
 
   // ── Calque technique (tous les repères) ──────────────────────────
