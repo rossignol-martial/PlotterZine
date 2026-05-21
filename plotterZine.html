@@ -1053,63 +1053,293 @@ function resetXf() {
 function rmSlot() { if(selSlot===null) return; delete placements[plKey(selSlot)]; selSlot=null; buildLib(); render(); buildXform(); }
 
 // ── Export SVG ────────────────────────────────────────────────────
-function exportSVG() {
+async function exportSVG() {
   if (CUR_MODE==='A4x4') {
     const savedSide=CUR_SIDE;
-    ['recto','verso'].forEach(side => { CUR_SIDE=side; buildSlots(); exportFace(`fanzine_A4_${side}.svg`); });
+    CUR_SIDE='recto'; buildSlots(); await exportFace('fanzine_A4_recto.svg');
+    CUR_SIDE='verso'; buildSlots(); await exportFace('fanzine_A4_verso.svg');
     CUR_SIDE=savedSide; buildSlots(); render();
     toast('Export recto + verso terminé !');
+  } else if (CUR_MODE==='COUPEL') {
+    const savedSide = COUPEL_SIDE;
+    setCoupeLSide('recto'); await exportFace('fanzine_coupL_recto.svg');
+    setCoupeLSide('verso');  await exportFace('fanzine_coupL_verso.svg');
+    setCoupeLSide(savedSide);
+    toast('Export recto + verso terminé !');
   } else {
-    if (CUR_MODE==='COUPEL') {
-      const savedSide = COUPEL_SIDE;
-      setCoupeLSide('recto'); exportFace('fanzine_coupL_recto.svg');
-      setCoupeLSide('verso');  exportFace('fanzine_coupL_verso.svg');
-      setCoupeLSide(savedSide);
-      toast('Export recto + verso termine !');
-    } else {
-      const fname = CUR_MODE==='LEPO' ? 'leporello_A3.svg' : CUR_MODE==='COUPET' ? 'fanzine_coupT_A3.svg' : 'fanzine_A6_8p_A3.svg';
-      exportFace(fname);
-      toast('Export termine !');
-    }
+    const fname = CUR_MODE==='LEPO' ? 'leporello_A3.svg' : CUR_MODE==='COUPET' ? 'fanzine_coupT_A3.svg' : 'fanzine_A6_8p_A3.svg';
+    await exportFace(fname);
+    toast('Export terminé !');
   }
 }
+
+
+// ── Clipping géométrique des paths SVG ──────────────────────────────────────
+// Applique une matrice affine aux paths et les clippe avec un rectangle
+function clipPathsGeom(svgContent, a,b,c,d,e,f, rx,ry,rw,rh) {
+  // Transformer un point
+  const tp = (px,py) => [a*px+c*py+e, b*px+d*py+f];
+  
+  // Clipper un segment de droite avec le rect (Cohen-Sutherland simplifié)
+  // Retourne les segments clippés en coords mm
+  const clipLine = (x1,y1,x2,y2) => {
+    const xmin=rx,xmax=rx+rw,ymin=ry,ymax=ry+rh;
+    const INSIDE=0,LEFT=1,RIGHT=2,BOTTOM=4,TOP=8;
+    const code = (x,y) => (x<xmin?LEFT:x>xmax?RIGHT:0)|(y<ymin?BOTTOM:y>ymax?TOP:0);
+    let c1=code(x1,y1), c2=code(x2,y2);
+    let [ax,ay,bx,by]=[x1,y1,x2,y2];
+    while(true){
+      if(!(c1|c2)) return [[ax,ay,bx,by]]; // both inside
+      if(c1&c2) return [];                  // both outside same region
+      const cout=c1||c2;
+      let x,y;
+      if(cout&TOP){x=ax+(bx-ax)*(ymax-ay)/(by-ay);y=ymax;}
+      else if(cout&BOTTOM){x=ax+(bx-ax)*(ymin-ay)/(by-ay);y=ymin;}
+      else if(cout&RIGHT){y=ay+(by-ay)*(xmax-ax)/(bx-ax);x=xmax;}
+      else{y=ay+(by-ay)*(xmin-ax)/(bx-ax);x=xmin;}
+      if(cout===c1){ax=x;ay=y;c1=code(x,y);}else{bx=x;by=y;c2=code(x,y);}
+    }
+  };
+
+  // Parser et transformer/clipper les paths
+  let result = '';
+  // Extraire tous les éléments path
+  const pathRe = /<path([^>]*?)d="([^"]*)"([^>]*)\/>/g;
+  let lastIndex = 0;
+  let m;
+  while((m=pathRe.exec(svgContent))!==null) {
+    const [full,pre,d,post] = m;
+    result += svgContent.slice(lastIndex, m.index);
+    lastIndex = m.index + full.length;
+    
+    // Parser le path d
+    const clippedD = transformClipPath(d, tp, clipLine);
+    if(clippedD.trim()) {
+      result += `<path${pre}d="${clippedD}"${post}/>`;
+    }
+  }
+  result += svgContent.slice(lastIndex);
+  return result;
+}
+
+function transformClipPath(d, tp, clipLine) {
+  const cmds = d.match(/[MmLlHhVvCcSsQqTtAaZz][^MmLlHhVvCcSsQqTtAaZz]*/g) || [];
+  let cx=0,cy=0,sx=0,sy=0;
+  let outPath = '';
+  let penX=null,penY=null; // position du stylo en mm (après transform)
+  const num = s => s.trim().split(/[\s,]+/).filter(x=>x!=='').map(Number);
+
+  // Ajouter un Move si le stylo n'est pas au bon endroit
+  const moveTo = (x,y) => { outPath+=`M ${x.toFixed(3)} ${y.toFixed(3)} `; penX=x;penY=y; };
+  const lineTo = (x,y) => { outPath+=`L ${x.toFixed(3)} ${y.toFixed(3)} `; penX=x;penY=y; };
+
+  // Clipper un bezier cubique par subdivision récursive (De Casteljau)
+  const clipCubic = (p0,p1,p2,p3, depth=0) => {
+    const xs=[p0[0],p1[0],p2[0],p3[0]], ys=[p0[1],p1[1],p2[1],p3[1]];
+    const xmin=Math.min(...xs),xmax=Math.max(...xs),ymin=Math.min(...ys),ymax=Math.max(...ys);
+    const rx=clipXmm,ry=clipYmm,rw=clipWmm,rh=clipHmm;
+    // Si entièrement hors → skip
+    if(xmax<rx||xmin>rx+rw||ymax<ry||ymin>ry+rh) return;
+    // Si assez petite ou trop profond → tracer comme ligne
+    const len=Math.hypot(p3[0]-p0[0],p3[1]-p0[1]);
+    if(depth>8||len<0.5) {
+      const segs=clipLine(p0[0],p0[1],p3[0],p3[1]);
+      if(segs.length) { const [x1,y1,x2,y2]=segs[0]; moveTo(x1,y1); lineTo(x2,y2); }
+      return;
+    }
+    // Subdiviser à t=0.5
+    const mid=(a,b)=>[(a[0]+b[0])/2,(a[1]+b[1])/2];
+    const m01=mid(p0,p1),m12=mid(p1,p2),m23=mid(p2,p3);
+    const m012=mid(m01,m12),m123=mid(m12,m23),m0123=mid(m012,m123);
+    clipCubic(p0,m01,m012,m0123,depth+1);
+    clipCubic(m0123,m123,m23,p3,depth+1);
+  };
+
+  for(const cmd of cmds) {
+    const type=cmd[0];
+    const args=num(cmd.slice(1));
+    if(type==='M'||type==='m') {
+      const abs=type==='M';
+      let i=0;
+      while(i+1<args.length) {
+        const nx=abs?args[i]:cx+args[i], ny=abs?args[i+1]:cy+args[i+1];
+        const [px,py]=tp(nx,ny);
+        moveTo(px,py);
+        if(i===0){sx=nx;sy=ny;}
+        cx=nx;cy=ny;i+=2;
+      }
+    } else if(type==='L'||type==='l') {
+      const abs=type==='L';
+      let i=0;
+      while(i+1<args.length) {
+        const nx=abs?args[i]:cx+args[i], ny=abs?args[i+1]:cy+args[i+1];
+        const [p1x,p1y]=tp(cx,cy),[p2x,p2y]=tp(nx,ny);
+        const segs=clipLine(p1x,p1y,p2x,p2y);
+        if(segs.length){const[x1,y1,x2,y2]=segs[0];moveTo(x1,y1);lineTo(x2,y2);}
+        cx=nx;cy=ny;i+=2;
+      }
+    } else if(type==='C'||type==='c') {
+      const abs=type==='C';
+      let i=0;
+      while(i+5<args.length) {
+        const x1=abs?args[i]:cx+args[i],y1=abs?args[i+1]:cy+args[i+1];
+        const x2=abs?args[i+2]:cx+args[i+2],y2=abs?args[i+3]:cy+args[i+3];
+        const x3=abs?args[i+4]:cx+args[i+4],y3=abs?args[i+5]:cy+args[i+5];
+        // Transformer les 4 points de la courbe
+        const p0=tp(cx,cy),p1t=tp(x1,y1),p2t=tp(x2,y2),p3t=tp(x3,y3);
+        clipCubic(p0,p1t,p2t,p3t);
+        cx=x3;cy=y3;i+=6;
+      }
+    } else if(type==='Z'||type==='z') {
+      // Fermer le path : clipper le segment retour
+      const [p1x,p1y]=tp(cx,cy),[p2x,p2y]=tp(sx,sy);
+      const segs=clipLine(p1x,p1y,p2x,p2y);
+      if(segs.length){const[x1,y1,x2,y2]=segs[0];moveTo(x1,y1);lineTo(x2,y2);}
+      cx=sx;cy=sy;
+    } else if(type==='H'||type==='h') {
+      const abs=type==='H';
+      for(const v of args){
+        const nx=abs?v:cx+v;
+        const [p1x,p1y]=tp(cx,cy),[p2x,p2y]=tp(nx,cy);
+        const segs=clipLine(p1x,p1y,p2x,p2y);
+        if(segs.length){const[x1,y1,x2,y2]=segs[0];moveTo(x1,y1);lineTo(x2,y2);}
+        cx=nx;
+      }
+    } else if(type==='V'||type==='v') {
+      const abs=type==='V';
+      for(const v of args){
+        const ny=abs?v:cy+v;
+        const [p1x,p1y]=tp(cx,cy),[p2x,p2y]=tp(cx,ny);
+        const segs=clipLine(p1x,p1y,p2x,p2y);
+        if(segs.length){const[x1,y1,x2,y2]=segs[0];moveTo(x1,y1);lineTo(x2,y2);}
+        cy=ny;
+      }
+    }
+  }
+  return outPath.trim();
+}
+
 
 async function exportFace(filename) {
   const m=MODES[CUR_MODE];
   let defs='<defs>'+SLOTS.map(s=>{const sw=s.w||PW,sh=s.h||PH;return `<clipPath id="cp${s.id}"><rect x="${s.x+SM}" y="${s.y+SM}" width="${sw-SM*2}" height="${sh-SM*2}"/></clipPath>`;}).join('')+'</defs>';
   let o='';
   toast('Génération SVG en cours…');
-  await new Promise(r=>setTimeout(r,50)); // laisser le browser respirer
+  await new Promise(r=>setTimeout(r,50));
+
   SLOTS.forEach(s => {
     const pl=placements[plKey(s.id)]; if(!pl) return;
     const pg=pages.find(p=>p.id===pl.pageId); if(!pg) return;
     const sw=s.w||PW, sh=s.h||PH;
     const rot=pl.rotate||0, swapped=Math.abs(rot)%180===90;
-    const cx=s.x+sw/2+(pl.tx||0), cy=s.y+sh/2+(pl.ty||0);
     const sc=pl.scale||1;
-    // viewBox original du SVG source (espace de coords px ou mm)
-    const vbE = pg.vbOrig || pg.vb;
-    const vbParts = vbE.split(/[\s,]+/).map(Number);
-    const vbw=vbParts[2]||100, vbh=vbParts[3]||100;
-    // Cover : remplir la case
+
+    // Utiliser pg.vb (toujours en mm) pour les calculs
+    // Les paths du SVG source sont en vbOrig (px si pas de viewBox mm)
+    // Inkscape convertit automatiquement px→mm dans les paths → utiliser mm partout
+    const vbMmP=(pg.vb).split(/[\s,]+/).map(Number);
+    const vbx=vbMmP[0]||0, vby=vbMmP[1]||0, vbw=vbMmP[2]||100, vbh=vbMmP[3]||100;
+
+    // vbOrig pour le transform de normalisation (si paths en px, les convertir en mm)
+    const vbOrigP=(pg.vbOrig||pg.vb).split(/[\s,]+/).map(Number);
+    const vbOrigW=vbOrigP[2]||100, vbOrigH=vbOrigP[3]||100;
+    // Ratio de normalisation px→mm (1.0 si déjà en mm, 25.4/96 si en px)
+    const normScale = vbw / vbOrigW;  // mm/unité_source
+
+    // Dimensions zone affichable selon rotation
     const cw=swapped?sh-SM*2:sw-SM*2, ch=swapped?sw-SM*2:sh-SM*2;
-    const fitC=Math.max(cw/vbw, ch/vbh)*sc;
-    const dw=vbw*fitC, dh=vbh*fitC;
-    // Extraire et préfixer les IDs du SVG source pour éviter collisions
-    const pid='e'+s.id;
+
+    // fitCover : identique à renderSheet (Math.MAX pour couvrir la case)
+    const fitContain = Math.max(cw/vbw, ch/vbh) * sc;
+
+    // Pan en mm → décalage en coords source
+    const tx = pl.tx||0, ty = pl.ty||0;
+    // Rotation : le pan s'applique dans l'espace de la case (mm)
+    // pour convertir en coords source, diviser par fitContain
+    // et tenir compte de la rotation (rot=90 → x et y s'échangent)
+    const rad = rot * Math.PI / 180;
+    const panSrcX = (tx * Math.cos(rad) + ty * Math.sin(rad)) / fitContain;
+    const panSrcY = (-tx * Math.sin(rad) + ty * Math.cos(rad)) / fitContain;
+
+    // Zone visible dans l'espace source (en coords du viewBox)
+    // La case visible fait cw×ch mm → en coords source : cw/fitContain × ch/fitContain
+    const visW = cw / fitContain;  // largeur visible en coords source
+    const visH = ch / fitContain;  // hauteur visible en coords source
+
+    // Centre du viewBox source (avec pan)
+    const srcCx = vbx + vbw/2 - panSrcX;
+    const srcCy = vby + vbh/2 - panSrcY;
+
+    // ViewBox recadré = zone exactement visible dans l'espace source
+    // → Inkscape/plotter voit uniquement les paths dans cette zone
+    const cropVbX = (srcCx - visW/2).toFixed(4);
+    const cropVbY = (srcCy - visH/2).toFixed(4);
+    const cropVbW = visW.toFixed(4);
+    const cropVbH = visH.toFixed(4);
+    const cropVb = `${cropVbX} ${cropVbY} ${cropVbW} ${cropVbH}`;
+
+    // Position du SVG imbriqué dans l'espace document (coin de la zone affichable)
+    // Tenir compte de la rotation pour la position x,y
+    const cx = s.x + sw/2, cy = s.y + sh/2;
+
+    // Parser et nettoyer le SVG source
+    const pid='p'+s.id;
     const parser=new DOMParser();
     const srcSvg=parser.parseFromString(pg.svgText,'image/svg+xml').querySelector('svg');
     if (!srcSvg) return;
-    const iDefs=srcSvg.querySelector('defs');
-    const prefixID=(str)=>str
-      .replace(/\bid="([^"]+)"/g,(_,id)=>`id="${pid}_${id}"`)
-      .replace(/url\(#([^)]+)\)/g,(_,id)=>`url(#${pid}_${id})`)
-      .replace(/href="#([^"]+)"/g,(_,id)=>`href="#${pid}_${id}"`);
-    const iDefsStr=iDefs?prefixID(iDefs.outerHTML):'';
-    const inner=prefixID(srcSvg.innerHTML.replace(/<defs[\s\S]*?<\/defs>/gi,''));
-    const embSvg=`<svg xmlns="http://www.w3.org/2000/svg" width="${dw}" height="${dh}" viewBox="${vbE}" preserveAspectRatio="xMidYMid slice" overflow="hidden">${iDefsStr}<g>${inner}</g></svg>`;
-    o+=`<g clip-path="url(#cp${s.id})"><g transform="translate(${cx},${cy}) rotate(${rot}) translate(${-(dw/2)},${-(dh/2)})">${embSvg}</g></g>`;
+
+    // Supprimer les éléments non-graphiques Inkscape/sodipodi
+    ['sodipodi\\:namedview','namedview','metadata','title','desc'].forEach(tag=>{
+      srcSvg.querySelectorAll(tag).forEach(el=>el.remove());
+    });
+
+    // Préfixer les IDs pour éviter les collisions entre pages
+    const prefID=(str)=>str
+      .replace(/\bid="([^"]+)"/g,  (_,id)=>`id="${pid}-${id}"`)
+      .replace(/url\(#([^)]+)\)/g, (_,id)=>`url(#${pid}-${id})`)
+      .replace(/href="#([^"]+)"/g,  (_,id)=>`href="#${pid}-${id}"`);
+
+    // Extraire defs et contenu
+    const defsEl=srcSvg.querySelector('defs');
+    const defsStr=defsEl?prefID(defsEl.innerHTML):'';
+    let inner=srcSvg.innerHTML
+      .replace(/<defs[\s\S]*?<\/defs>/gi,'')
+      .replace(/<sodipodi:[\s\S]*?<\/sodipodi:[^>]+>/gi,'')
+      .replace(/<inkscape:[\s\S]*?<\/inkscape:[^>]+>/gi,'')
+      .replace(/<metadata[\s\S]*?<\/metadata>/gi,'')
+      // Supprimer les rects de fond blanc — inutiles pour plotter
+      .replace(/<rect[^>]*fill="#ffffff"[^>]*\/>/gi,'')
+      .replace(/<rect[^>]*fill="#fff"[^>]*\/>/gi,'')
+      .replace(/<rect[^>]*fill="white"[^>]*\/>/gi,'')
+      // Supprimer les calques "cadre" du SVG source (seront remplacés par le cadre PlotterZine)
+      .replace(/<g[^>]*inkscape:label="cadre"[^>]*>[\s\S]*?<\/g>/gi,'')
+      .replace(/<g[^>]*id="[^"]*cadre[^"]*"[^>]*>[\s\S]*?<\/g>/gi,'')
+      .trim();
+    inner=prefID(inner);
+
+    // Defs du SVG source dans le groupe transformé (pas dans les defs globaux)
+    // car leurs coordonnées sont en px, pas en mm
+    // SVG imbriqué avec viewBox recadré
+    // x,y = coin de la zone affichable après rotation de la case
+    // Pour rot=0 : x=s.x+SM, y=s.y+SM
+    // Pour rot=90/270 : la zone affichable pivote → on utilise le centre + translate
+    // Transform : placer le contenu source dans l'espace mm du document
+        // Matrice affine : normScale → translate(-srcCx,-srcCy) → scale(fit) → rotate → translate
+    const fitN = fitContain * normScale;
+    const rad2 = rot * Math.PI / 180;
+    const cosR = Math.cos(rad2), sinR = Math.sin(rad2);
+    const ma = cosR*fitN, mb = sinR*fitN, mc = -sinR*fitN, md = cosR*fitN;
+    const me = cosR*fitContain*(-srcCx*normScale) + (-sinR)*fitContain*(-srcCy*normScale) + (cx+tx);
+    const mf = sinR*fitContain*(-srcCx*normScale) + cosR*fitContain*(-srcCy*normScale) + (cy+ty);
+    const clipXmm=s.x+SM, clipYmm=s.y+SM, clipWmm=sw-SM*2, clipHmm=sh-SM*2; // zone A6 moins marge 5mm
+    const clippedInner = clipPathsGeom(inner, ma,mb,mc,md,me,mf, clipXmm,clipYmm,clipWmm,clipHmm);
+    // Cadre de la zone imprimable (case A6 - marge 5mm) en mm document
+    const fX=(s.x+SM).toFixed(3), fY=(s.y+SM).toFixed(3);
+    const fW=(sw-SM*2).toFixed(3), fH=(sh-SM*2).toFixed(3);
+    const cadre=`<rect x="${fX}" y="${fY}" width="${fW}" height="${fH}" fill="none" stroke="#000000" stroke-width="0.3"/>`;
+    o+=`<g id="page-${s.num}">${clippedInner}${cadre}</g>\n`;
   });
+
 
   // ── Calque technique (tous les repères) ──────────────────────────
   let tech='';
